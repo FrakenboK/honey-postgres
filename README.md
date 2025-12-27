@@ -1,7 +1,17 @@
 # honey-postgres
-PostgreSQL honeypot in Golang
+PostgreSQL Honeypot in Golang
 
-To start:
+## Usage
 ```
-openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+frakenbok@frakenbok$ honey-postgres -h
+Usage of ./honey-postgres:
+  -o string
+    	output file for captured credentials
+  -port int
+    	port to listen on (default 5432)
+  -tls
+    	enable TLS (self-signed cert)
 ```
+
+## Demo
+![alt text](image.png)

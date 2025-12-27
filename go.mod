@@ -1,4 +1,4 @@
-module honey
+module honey-postgres
 
 go 1.25.0
 

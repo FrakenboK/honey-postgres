@@ -3,10 +3,13 @@ package main
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"sync"
 	"time"
 )
 
@@ -15,24 +18,50 @@ const (
 	AuthCleartextPassword = 3
 )
 
+var (
+	useTLS  bool
+	outFile string
+	port    int
+
+	outMu sync.Mutex
+	outFd *os.File
+)
+
 func main() {
-	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
-	if err != nil {
-		log.Fatal(err)
+	flag.BoolVar(&useTLS, "tls", false, "enable TLS (self-signed cert)")
+	flag.StringVar(&outFile, "o", "", "output file for captured credentials")
+	flag.IntVar(&port, "port", 5432, "port to listen on")
+	flag.Parse()
+
+	if outFile != "" {
+		var err error
+		outFd, err = os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer outFd.Close()
 	}
 
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+	var tlsCfg *tls.Config
+	if useTLS {
+		cert, err := generateSelfSignedCert()
+		if err != nil {
+			log.Fatal(err)
+		}
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 	}
 
-	ln, err := net.Listen("tcp", ":5432")
+	addr := fmt.Sprintf(":%d", port)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer ln.Close()
 
-	log.Println("Postgres honeypot listening on :5432")
+	log.Printf("Postgres honey-postgrespot listening on %s (tls=%v)\n", addr, useTLS)
 
 	for {
 		conn, err := ln.Accept()
@@ -45,9 +74,8 @@ func main() {
 
 func handle(conn net.Conn, tlsCfg *tls.Config) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
 
-	// === SSLRequest ===
 	buf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return
@@ -58,33 +86,47 @@ func handle(conn net.Conn, tlsCfg *tls.Config) {
 		return
 	}
 
-	// Say "yes, SSL"
-	conn.Write([]byte("S"))
-
-	// Upgrade to TLS
-	tlsConn := tls.Server(conn, tlsCfg)
-	if err := tlsConn.Handshake(); err != nil {
-		return
+	if tlsCfg != nil {
+		conn.Write([]byte("S"))
+		tlsConn := tls.Server(conn, tlsCfg)
+		if err := tlsConn.Handshake(); err != nil {
+			return
+		}
+		conn = tlsConn
+	} else {
+		conn.Write([]byte("N"))
 	}
 
-	user, db, err := readStartupMessage(tlsConn)
+	user, db, err := readStartupMessage(conn)
 	if err != nil {
 		return
 	}
 
-	sendAuthCleartext(tlsConn)
+	sendAuthCleartext(conn)
 
-	password, err := readPasswordMessage(tlsConn)
+	password, err := readPasswordMessage(conn)
 	if err != nil {
 		return
 	}
 
-	log.Printf(
-		"[ATTEMPT] from=%s user=%s db=%s password=%q",
-		conn.RemoteAddr(), user, db, password,
+	logAttempt(conn.RemoteAddr().String(), user, db, password)
+	sendError(conn, "password authentication failed")
+}
+
+func logAttempt(addr, user, db, pass string) {
+	line := fmt.Sprintf(
+		"%s from=%s user=%s db=%s password=%q\n",
+		time.Now().Format(time.RFC3339),
+		addr, user, db, pass,
 	)
 
-	sendError(tlsConn, "password authentication failed")
+	log.Print("[ATTEMPT] " + line)
+
+	if outFd != nil {
+		outMu.Lock()
+		outFd.WriteString(line)
+		outMu.Unlock()
+	}
 }
 
 func readStartupMessage(conn net.Conn) (user, db string, err error) {
